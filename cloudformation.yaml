@@ -60,46 +60,12 @@ Resources:
         deadLetterTargetArn: !GetAtt ScanJobDLQ.Arn
         maxReceiveCount: 3
 
-  # ─── IAM Role for EC2 ──────────────────────────────────────────────
-  EC2InstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: secureci-api-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: secureci-api-policy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:GetItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:Query
-                  - dynamodb:Scan
-                Resource: !GetAtt JobsTable.Arn
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                  - sqs:GetQueueAttributes
-                Resource: !GetAtt ScanJobQueue.Arn
-              - Effect: Allow
-                Action:
-                  - ssm:GetParameter
-                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/secureci/*'
-
+  # ─── IAM Instance Profile (using Learner Lab's pre-built LabRole) ──
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
-        - !Ref EC2InstanceRole
+        - LabRole
 
   # ─── Security Group ────────────────────────────────────────────────
   APISecurityGroup:
@@ -131,6 +97,7 @@ Resources:
           #!/bin/bash
           yum update -y
           yum install -y python3 python3-pip git
+          pip3 install fastapi uvicorn boto3 requests PyGithub
 
           # Write environment config
           cat > /home/ec2-user/.env << EOF
@@ -140,17 +107,7 @@ Resources:
           SSM_WEBHOOK_SECRET=/secureci/webhook-secret
           EOF
 
-          # Clone repo and install dependencies
-          cd /home/ec2-user
-          git clone https://github.com/JunkaiDing/cs6620-project.git
-          pip3 install -r /home/ec2-user/cs6620-project/api/requirements.txt
-
-          # Load env and start API
-          export $(grep -v '^#' /home/ec2-user/.env | xargs)
-          cd /home/ec2-user/cs6620-project/api
-          nohup uvicorn app:app --host 0.0.0.0 --port 8000 > /var/log/secureci.log 2>&1 &
-
-          echo "SecureCI API started" > /home/ec2-user/ready.txt
+          echo "SecureCI API instance ready" > /home/ec2-user/ready.txt
       Tags:
         - Key: Name
           Value: secureci-api
