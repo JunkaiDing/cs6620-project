@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SecureCI - Core API Infrastructure (Junkai)'
+
+Parameters:
+  KeyPairName:
+    Type: String
+    Default: vockey
+    Description: EC2 Key Pair name
+
+  GitHubWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: GitHub webhook secret token
+
+  AMIId:
+    Type: String
+    Default: ami-0c02fb55956c7d316
+    Description: Amazon Linux 2 AMI (us-east-1)
+
+Resources:
+
+  # ─── Parameter Store ───────────────────────────────────────────────
+  WebhookSecretParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /secureci/webhook-secret
+      Type: String
+      Value: !Ref GitHubWebhookSecret
+      Description: GitHub webhook HMAC secret
+
+  # ─── DynamoDB ──────────────────────────────────────────────────────
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: secureci-jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ─── SQS (main + DLQ) ──────────────────────────────────────────────
+  ScanJobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: secureci-scan-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  ScanJobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: secureci-scan-jobs
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ScanJobDLQ.Arn
+        maxReceiveCount: 3
+
+  # ─── IAM Instance Profile (using Learner Lab's pre-built LabRole) ──
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - LabRole
+
+  # ─── Security Group ────────────────────────────────────────────────
+  APISecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SecureCI API - allow SSH and webhook port
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+
+  # ─── EC2 Instance ──────────────────────────────────────────────────
+  APIInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AMIId
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroups:
+        - !Ref APISecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 python3-pip git
+          pip3 install fastapi uvicorn boto3 requests PyGithub
+
+          # Write environment config
+          cat > /home/ec2-user/.env << EOF
+          AWS_REGION=${AWS::Region}
+          DYNAMODB_TABLE=secureci-jobs
+          SQS_QUEUE_URL=https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/secureci-scan-jobs
+          SSM_WEBHOOK_SECRET=/secureci/webhook-secret
+          EOF
+
+          echo "SecureCI API instance ready" > /home/ec2-user/ready.txt
+      Tags:
+        - Key: Name
+          Value: secureci-api
+
+# ─── Outputs ─────────────────────────────────────────────────────────
+Outputs:
+  EC2PublicIP:
+    Description: Public IP of the API instance
+    Value: !GetAtt APIInstance.PublicIp
+
+  EC2PublicDNS:
+    Description: Public DNS of the API instance
+    Value: !GetAtt APIInstance.PublicDnsName
+
+  WebhookURL:
+    Description: GitHub webhook URL to configure
+    Value: !Sub 'http://${APIInstance.PublicIp}:8000/webhook'
+
+  SQSQueueURL:
+    Description: SQS Queue URL
+    Value: !Ref ScanJobQueue
+
+  DLQUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref ScanJobDLQ
+
+  DynamoDBTable:
+    Description: DynamoDB table name
+    Value: !Ref JobsTable
