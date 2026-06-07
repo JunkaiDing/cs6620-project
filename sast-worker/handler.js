@@ -15,11 +15,12 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { pipeline } from 'node:stream/promises';
-import { createWriteStream } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { createGunzip } from 'node:zlib';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { join, dirname } from 'node:path';
+import { Readable } from 'node:stream';
+import tar from 'tar-stream';
 import { scanDirectory } from './scanner.js';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
@@ -51,9 +52,10 @@ async function updateJob(jobId, fields) {
 }
 
 // Download + extract a GitHub repo at a commit into a temp dir. Returns the dir path.
+// Extraction is pure JS (gunzip + tar-stream) so it needs no `tar` system binary,
+// which the Lambda Node runtime does not include.
 async function fetchRepo(repo, commitSha) {
   const workdir = await mkdtemp(join(tmpdir(), 'sast-'));
-  const tarPath = join(workdir, 'repo.tar.gz');
 
   // codeload serves a tarball for any ref without needing git
   const url = `https://codeload.github.com/${repo}/tar.gz/${commitSha}`;
@@ -61,9 +63,28 @@ async function fetchRepo(repo, commitSha) {
   const res = await fetch(url, { headers });
   if (!res.ok) throw new Error(`GitHub download failed: ${res.status} ${url}`);
 
-  await pipeline(res.body, createWriteStream(tarPath));
-  // tar is available in the Lambda Node runtime image
-  execFileSync('tar', ['-xzf', tarPath, '-C', workdir]);
+  const extract = tar.extract();
+
+  extract.on('entry', async (header, stream, next) => {
+    // Only write regular files; skip dirs/symlinks. Cap file size to avoid huge blobs.
+    if (header.type !== 'file') { stream.resume(); return next(); }
+    const destPath = join(workdir, header.name);
+    const chunks = [];
+    stream.on('data', (c) => chunks.push(c));
+    stream.on('end', async () => {
+      try {
+        await mkdir(dirname(destPath), { recursive: true });
+        await writeFile(destPath, Buffer.concat(chunks));
+      } catch (e) {
+        console.error('write failed for', destPath, e);
+      }
+      next();
+    });
+    stream.on('error', next);
+  });
+
+  // Pipe: HTTP body -> gunzip -> tar extractor. Resolves when extraction finishes.
+  await pipeline(Readable.fromWeb(res.body), createGunzip(), extract);
   return workdir; // scanDirectory skips node_modules / dotfiles on its own
 }
 
