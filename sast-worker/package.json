@@ -1,0 +1,15 @@
+{
+    "name": "secureci-sast-worker",
+    "version": "1.0.0",
+    "description": "SecureCI SAST worker Lambda — regex scanner over GitHub PR code",
+    "type": "module",
+    "main": "handler.js",
+    "scripts": {
+      "test:local": "node local-test.js"
+    },
+    "dependencies": {
+      "@aws-sdk/client-s3": "^3.600.0",
+      "@aws-sdk/client-dynamodb": "^3.600.0",
+      "@aws-sdk/lib-dynamodb": "^3.600.0"
+    }
+  }

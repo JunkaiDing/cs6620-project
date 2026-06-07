@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SecureCI - SAST Worker slice (Herry). Consumes its own SAST queue, scans, writes to S3 + the shared DynamoDB table.'
+
+Parameters:
+  JobsTableName:
+    Type: String
+    Default: secureci-jobs
+    Description: Name of the shared DynamoDB jobs table (created by Junkai's Core API stack)
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket holding the zipped Lambda deployment package
+
+  LambdaCodeKey:
+    Type: String
+    Default: sast-worker.zip
+    Description: S3 key of the zipped Lambda deployment package
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional GitHub token (private repos / higher rate limit)
+
+Resources:
+
+  # ─── Reports bucket (owned by this slice) ──────────────────────────
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'secureci-sast-reports-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ─── SAST queue + its own DLQ ──────────────────────────────────────
+  # We split the original single queue into per-worker queues so SAST and
+  # Pentest each get their own DLQ and visibility timeout. Junkai's API must
+  # route by job_type to SAST_QUEUE_URL vs PENTEST_QUEUE_URL (see NOTE-FOR-JUNKAI.md).
+  SastJobDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: secureci-sast-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  SastJobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: secureci-sast-jobs
+      # Must be >= Lambda timeout. Lambda timeout below is 120s, so 180s here.
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SastJobDLQ.Arn
+        maxReceiveCount: 3
+
+  # ─── Lambda (uses Learner Lab's pre-built LabRole) ─────────────────
+  SastWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: secureci-sast-worker
+      Runtime: nodejs20.x
+      Handler: handler.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          REPORTS_BUCKET: !Ref ReportsBucket
+          DYNAMODB_TABLE: !Ref JobsTableName
+          GITHUB_TOKEN: !Ref GitHubToken
+
+  # ─── Wire the SAST queue to the Lambda ─────────────────────────────
+  SastEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SastJobQueue.Arn
+      FunctionName: !Ref SastWorkerFunction
+      BatchSize: 1
+      Enabled: true
+
+Outputs:
+  ReportsBucketName:
+    Description: S3 bucket where scan reports are written
+    Value: !Ref ReportsBucket
+
+  SastQueueURL:
+    Description: URL of the SAST job queue (give this to Junkai's API as SAST_QUEUE_URL)
+    Value: !Ref SastJobQueue
+
+  SastQueueArn:
+    Value: !GetAtt SastJobQueue.Arn
+
+  SastDLQURL:
+    Description: SAST dead-letter queue
+    Value: !Ref SastJobDLQ
+
+  SastWorkerFunctionName:
+    Value: !Ref SastWorkerFunction
